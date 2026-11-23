@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Mochi Drop — catch the mochi, dodge the burnt ones</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #2b1d2e; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: "Trebuchet MS", "Segoe UI", system-ui, sans-serif; }
+  #wrap { position: relative; width: min(100vw, 56.25vh); height: min(100vh, 177.78vw); }
+  canvas { display: block; width: 100%; height: 100%; border-radius: 0; touch-action: none; }
+  #testout { position: absolute; inset: 0; background: #fff7f0; color: #2b1d2e; font: 16px/1.5 monospace; padding: 24px; overflow: auto; white-space: pre-wrap; display: none; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="540" height="960"></canvas>
+  <div id="testout"></div>
+</div>
+<script>
+"use strict";
+/* Mochi Drop — a tiny catch game built from one prompt.
+   Move the plate, catch pink (+10) and gold (+25) mochi, dodge the burnt ones.
+   ?demo=1  autoplay (the plate steers itself, restarts on its own)
+   ?test=1  deterministic self-test, prints PASS/FAIL to the page          */
+
+const W = 540, H = 960;
+const PLATE_Y = 872, PLATE_W = 118, PLATE_H = 20;
+const FLOOR_Y = 920;
+const params = new URLSearchParams(location.search);
+const DEMO = params.has("demo");
+const TEST = params.has("test");
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const MOCHI = {
+  pink:  { r: 24, vy: 1.0, score: 10, color: "#ff9ebb", face: "#7a2d44", w: 0.80 },
+  gold:  { r: 22, vy: 1.35, score: 25, color: "#ffd166", face: "#7a5a12", w: 0.12 },
+  burnt: { r: 26, vy: 0.9, score: 0, color: "#4a3b42", face: "#d8c8ce", w: 0.08 },
+};
+
+function pickType(rng) {
+  const r = rng();
+  let acc = 0;
+  for (const k of ["pink", "gold", "burnt"]) { acc += MOCHI[k].w; if (r < acc) return k; }
+  return "pink";
+}
+
+function makeState(rng) {
+  return {
+    rng, demo: DEMO, plateX: W / 2, mochi: [], parts: [], popups: [],
+    score: 0, lives: 3, combo: 0, bestCombo: 0, caught: 0, missed: 0,
+    spawnT: 0, elapsed: 0, over: false, overT: 0, shake: 0, flash: 0,
+    clouds: Array.from({ length: 5 }, (_, i) => ({ x: rng() * W, y: 40 + rng() * 260, s: 0.6 + rng() * 0.9, v: 6 + rng() * 10, o: i })),
+  };
+}
+
+function speedFor(elapsed) { return 1 + Math.min(1.6, elapsed / 45000); }
+function spawnInterval(elapsed) { return Math.max(380, 780 - elapsed / 90); }
+
+function spawnMochi(s) {
+  const type = pickType(s.rng);
+  const m = MOCHI[type];
+  s.mochi.push({
+    type, x: 30 + s.rng() * (W - 60), y: -30,
+    vy: (150 + s.rng() * 60) * m.vy, r: m.r,
+    wob: s.rng() * Math.PI * 2, spin: (s.rng() - 0.5) * 1.2,
+  });
+}
+
+function burst(s, x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = s.rng() * Math.PI * 2, sp = 60 + s.rng() * 160;
+    s.parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60, life: 0.5 + s.rng() * 0.4, t: 0, color, r: 3 + s.rng() * 4 });
+  }
+}
+
+function popup(s, x, y, text, color) {
+  s.popups.push({ x, y, text, color, t: 0, life: 1.1 });
+}
+
+function step(s, dt) {
+  if (s.over) { s.overT += dt; return; }
+  s.elapsed += dt;
+  const sp = speedFor(s.elapsed);
+
+  // demo autopilot: steer toward the lowest good mochi, dodge the lowest burnt one
+  if (s.demo) {
+    let target = null, danger = null;
+    for (const m of s.mochi) {
+      if (m.type === "burnt") { if (!danger || m.y > danger.y) danger = m; }
+      else if (!target || m.y > target.y) target = m;
+    }
+    let tx = s.plateX;
+    if (danger && danger.y > PLATE_Y - 220 && Math.abs(danger.x - s.plateX) < 90) {
+      tx = danger.x < s.plateX ? Math.min(W - PLATE_W / 2, s.plateX + 140) : Math.max(PLATE_W / 2, s.plateX - 140);
+    } else if (target) tx = target.x;
+    const maxStep = 560 * dt;
+    s.plateX += Math.max(-maxStep, Math.min(maxStep, tx - s.plateX));
+  }
+  s.plateX = Math.max(PLATE_W / 2, Math.min(W - PLATE_W / 2, s.plateX));
+
+  s.spawnT -= dt * 1000;
+  if (s.spawnT <= 0) { spawnMochi(s); s.spawnT = spawnInterval(s.elapsed); }
+
+  for (const c of s.clouds) { c.x += c.v * dt; if (c.x > W + 90) c.x = -90; }
+
+  for (let i = s.mochi.length - 1; i >= 0; i--) {
+    const m = s.mochi[i];
+    m.y += m.vy * sp * dt;
+    m.wob += dt * 2;
+    m.x += Math.sin(m.wob) * 12 * dt;
+    const plateTop = PLATE_Y - PLATE_H / 2;
+    const caught = m.y + m.r >= plateTop && m.y < plateTop + 26 &&
+      Math.abs(m.x - s.plateX) <= PLATE_W / 2 + m.r * 0.6;
+    if (caught) {
+      s.mochi.splice(i, 1);
+      if (m.type === "burnt") {
+        s.lives--; s.combo = 0; s.shake = 14; s.flash = 0.35;
+        popup(s, s.plateX, PLATE_Y - 46, "BURNT!", "#e4572e");
+        burst(s, m.x, plateTop, "#4a3b42", 10);
+        if (s.lives <= 0) { s.over = true; s.overT = 0; }
+      } else {
+        const base = MOCHI[m.type].score;
+        s.combo++; s.bestCombo = Math.max(s.bestCombo, s.combo); s.caught++;
+        const mult = s.combo >= 5 ? 2 : 1;
+        s.score += base * mult;
+        popup(s, m.x, plateTop - 30, "+" + (base * mult) + (mult > 1 ? " x2!" : ""), m.type === "gold" ? "#e8a020" : "#d94f70");
+        burst(s, m.x, plateTop, MOCHI[m.type].color, m.type === "gold" ? 14 : 8);
+      }
+      continue;
+    }
+    if (m.y - m.r > FLOOR_Y) {
+      s.mochi.splice(i, 1);
+      if (m.type !== "burnt") { s.missed++; s.combo = 0; }
+    }
+  }
+
+  for (let i = s.parts.length - 1; i >= 0; i--) {
+    const p = s.parts[i];
+    p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 320 * dt;
+    if (p.t >= p.life) s.parts.splice(i, 1);
+  }
+  for (let i = s.popups.length - 1; i >= 0; i--) {
+    const p = s.popups[i];
+    p.t += dt; p.y -= 34 * dt;
+    if (p.t >= p.life) s.popups.splice(i, 1);
+  }
+  if (s.shake > 0) s.shake = Math.max(0, s.shake - 40 * dt);
+  if (s.flash > 0) s.flash = Math.max(0, s.flash - dt);
+}
+
+/* ---------------- render ---------------- */
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawMochi(m) {
+  const def = MOCHI[m.type];
+  ctx.save();
+  ctx.translate(m.x, m.y);
+  ctx.rotate(Math.sin(m.wob) * 0.12 + m.spin * 0.1);
+  // body
+  ctx.fillStyle = def.color;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, m.r, m.r * 0.92, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // squish highlight
+  ctx.fillStyle = "rgba(255,255,255,0.45)";
+  ctx.beginPath();
+  ctx.ellipse(-m.r * 0.38, -m.r * 0.42, m.r * 0.3, m.r * 0.18, -0.5, 0, Math.PI * 2);
+  ctx.fill();
+  // face
+  ctx.fillStyle = def.face;
+  ctx.beginPath(); ctx.arc(-m.r * 0.32, -m.r * 0.05, 2.6, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(m.r * 0.32, -m.r * 0.05, 2.6, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = def.face; ctx.lineWidth = 2.4; ctx.lineCap = "round";
+  ctx.beginPath();
+  if (m.type === "burnt") { ctx.arc(0, m.r * 0.45, m.r * 0.22, Math.PI * 1.15, Math.PI * 1.85); }
+  else { ctx.arc(0, m.r * 0.18, m.r * 0.28, Math.PI * 0.15, Math.PI * 0.85); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function draw(s) {
+  ctx.save();
+  if (s.shake > 0) ctx.translate((Math.random() - 0.5) * s.shake, (Math.random() - 0.5) * s.shake);
+  // sky
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#ffe9ec");
+  g.addColorStop(0.55, "#fff6e8");
+  g.addColorStop(1, "#ffe3ee");
+  ctx.fillStyle = g;
+  ctx.fillRect(-20, -20, W + 40, H + 40);
+  // clouds
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  for (const c of s.clouds) {
+    ctx.beginPath();
+    ctx.ellipse(c.x, c.y, 52 * c.s, 20 * c.s, 0, 0, Math.PI * 2);
+    ctx.ellipse(c.x + 34 * c.s, c.y + 6 * c.s, 36 * c.s, 15 * c.s, 0, 0, Math.PI * 2);
+    ctx.ellipse(c.x - 36 * c.s, c.y + 8 * c.s, 32 * c.s, 13 * c.s, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // floor
+  ctx.fillStyle = "#ffd9c2";
+  ctx.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
+  ctx.fillStyle = "#f7b98d";
+  ctx.fillRect(0, FLOOR_Y, W, 6);
+
+  for (const m of s.mochi) drawMochi(m);
+
+  // particles
+  for (const p of s.parts) {
+    ctx.globalAlpha = 1 - p.t / p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // plate
+  ctx.fillStyle = "#7c5cbf";
+  roundRect(s.plateX - PLATE_W / 2, PLATE_Y - PLATE_H / 2, PLATE_W, PLATE_H, 10);
+  ctx.fill();
+  ctx.fillStyle = "#9d7fe0";
+  roundRect(s.plateX - PLATE_W / 2 + 6, PLATE_Y - PLATE_H / 2 + 3, PLATE_W - 12, 6, 3);
+  ctx.fill();
+  // plate feet
+  ctx.fillStyle = "#5e4391";
+  ctx.fillRect(s.plateX - 34, PLATE_Y + PLATE_H / 2, 10, 8);
+  ctx.fillRect(s.plateX + 24, PLATE_Y + PLATE_H / 2, 10, 8);
+
+  // popups
+  ctx.textAlign = "center";
+  for (const p of s.popups) {
+    ctx.globalAlpha = 1 - p.t / p.life;
+    ctx.font = "bold 26px 'Trebuchet MS', sans-serif";
+    ctx.fillStyle = p.color;
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // HUD
+  ctx.fillStyle = "rgba(43,29,46,0.92)";
+  roundRect(16, 16, 120, 56, 14); ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 30px 'Trebuchet MS', sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("♥".repeat(Math.max(0, s.lives)) + "♡".repeat(Math.max(0, 3 - s.lives)), 30, 54);
+  ctx.fillStyle = "rgba(43,29,46,0.92)";
+  roundRect(W - 176, 16, 160, 56, 14); ctx.fill();
+  ctx.fillStyle = "#ffd166";
+  ctx.font = "bold 30px 'Trebuchet MS', sans-serif";
+  ctx.textAlign = "right";
+  ctx.fillText(String(s.score).padStart(5, "0"), W - 32, 54);
+  if (s.combo >= 3) {
+    ctx.fillStyle = "#d94f70";
+    ctx.font = "bold 22px 'Trebuchet MS', sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("COMBO x" + s.combo, W / 2, 108);
+  }
+  if (DEMO) {
+    ctx.fillStyle = "rgba(124,92,191,0.9)";
+    roundRect(W / 2 - 62, H - 44, 124, 30, 15); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 16px 'Trebuchet MS', sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("AUTO PLAY", W / 2, H - 23);
+  }
+  if (s.flash > 0) {
+    ctx.fillStyle = "rgba(228,87,46," + (s.flash * 0.5).toFixed(2) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (s.over) {
+    ctx.fillStyle = "rgba(43,29,46,0.72)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.font = "bold 54px 'Trebuchet MS', sans-serif";
+    ctx.fillText("Game Over", W / 2, H / 2 - 60);
+    ctx.font = "bold 34px 'Trebuchet MS', sans-serif";
+    ctx.fillStyle = "#ffd166";
+    ctx.fillText("Score  " + s.score, W / 2, H / 2 + 4);
+    ctx.font = "22px 'Trebuchet MS', sans-serif";
+    ctx.fillStyle = "#ffd9c2";
+    ctx.fillText("caught " + s.caught + "  ·  best combo x" + s.bestCombo, W / 2, H / 2 + 44);
+    ctx.font = "bold 22px 'Trebuchet MS', sans-serif";
+    ctx.fillStyle = "#fff";
+    ctx.fillText(DEMO ? "restarting…" : "tap to play again", W / 2, H / 2 + 100);
+  }
+  ctx.restore();
+}
+
+/* ---------------- self-test ---------------- */
+function runTests() {
+  const out = document.getElementById("testout");
+  out.style.display = "block";
+  const lines = [];
+  let pass = 0, total = 0;
+  function check(name, ok, extra) {
+    total++; if (ok) pass++;
+    lines.push((ok ? "PASS " : "FAIL ") + name + (extra !== undefined ? "  [" + extra + "]" : ""));
+  }
+  const rng = mulberry32(12345);
+
+  // type distribution is sane over 2000 draws
+  const counts = { pink: 0, gold: 0, burnt: 0 };
+  for (let i = 0; i < 2000; i++) counts[pickType(rng)]++;
+  check("spawn mix pink ~80%", counts.pink > 1400 && counts.pink < 1800, counts.pink);
+  check("spawn mix gold ~12%", counts.gold > 150 && counts.gold < 350, counts.gold);
+  check("spawn mix burnt ~8%", counts.burnt > 80 && counts.burnt < 260, counts.burnt);
+
+  // catch scoring
+  let s = makeState(mulberry32(7));
+  s.mochi.push({ type: "pink", x: s.plateX, y: PLATE_Y - 30, vy: 200, r: 24, wob: 0, spin: 0 });
+  step(s, 0.1);
+  check("pink catch +10", s.score === 10 && s.caught === 1, "score=" + s.score);
+  check("combo increments", s.combo === 1);
+
+  // gold + combo multiplier
+  s = makeState(mulberry32(7));
+  s.combo = 4;
+  s.mochi.push({ type: "gold", x: s.plateX, y: PLATE_Y - 30, vy: 200, r: 22, wob: 0, spin: 0 });
+  step(s, 0.1);
+  check("gold at combo 5 pays x2 (50)", s.score === 50, "score=" + s.score);
+
+  // burnt costs a life and resets combo
+  s = makeState(mulberry32(7));
+  s.combo = 3;
+  s.mochi.push({ type: "burnt", x: s.plateX, y: PLATE_Y - 30, vy: 200, r: 26, wob: 0, spin: 0 });
+  step(s, 0.1);
+  check("burnt catch -1 life", s.lives === 2 && s.combo === 0, "lives=" + s.lives);
+
+  // missing a good mochi breaks combo, costs no life
+  s = makeState(mulberry32(7));
+  s.combo = 3;
+  s.mochi.push({ type: "pink", x: 20, y: FLOOR_Y + 40, vy: 200, r: 24, wob: 0, spin: 0 });
+  step(s, 0.1);
+  check("miss breaks combo, keeps lives", s.combo === 0 && s.lives === 3 && s.missed === 1);
+
+  // missing a burnt mochi is free
+  s = makeState(mulberry32(7));
+  s.mochi.push({ type: "burnt", x: 20, y: FLOOR_Y + 40, vy: 200, r: 26, wob: 0, spin: 0 });
+  step(s, 0.1);
+  check("burnt miss is free", s.lives === 3 && s.missed === 0);
+
+  // game over at 0 lives
+  s = makeState(mulberry32(7));
+  s.lives = 1;
+  s.mochi.push({ type: "burnt", x: s.plateX, y: PLATE_Y - 30, vy: 200, r: 26, wob: 0, spin: 0 });
+  step(s, 0.1);
+  check("game over at 0 lives", s.over === true);
+
+  // plate clamps to the field
+  s = makeState(mulberry32(7));
+  s.plateX = -500; step(s, 0.016);
+  check("plate clamps left", s.plateX === PLATE_W / 2, "x=" + s.plateX);
+  s.plateX = 9999; step(s, 0.016);
+  check("plate clamps right", s.plateX === W - PLATE_W / 2, "x=" + s.plateX);
+
+  // demo autopilot moves toward a falling good mochi
+  s = makeState(mulberry32(7));
+  s.demo = true;
+  s.plateX = 100;
+  s.mochi.push({ type: "pink", x: 400, y: 300, vy: 150, r: 24, wob: 0, spin: 0 });
+  const before = s.plateX;
+  step(s, 0.5);
+  check("demo steers toward mochi", s.plateX > before, before + " -> " + s.plateX.toFixed(0));
+
+  // demo dodges a low burnt mochi overhead
+  s = makeState(mulberry32(7));
+  s.demo = true;
+  s.plateX = 270;
+  s.mochi.push({ type: "burnt", x: 270, y: PLATE_Y - 150, vy: 150, r: 26, wob: 0, spin: 0 });
+  step(s, 0.3);
+  check("demo dodges burnt", Math.abs(s.plateX - 270) > 20, "x=" + s.plateX.toFixed(0));
+
+  // difficulty ramps with time
+  check("speed ramps up", speedFor(60000) > speedFor(0), speedFor(60000).toFixed(2));
+  check("spawn interval shrinks", spawnInterval(60000) < spawnInterval(0), spawnInterval(60000).toFixed(0));
+
+  // a 30s simulated demo run scores and survives
+  s = makeState(mulberry32(99));
+  s.demo = true;
+  for (let t = 0; t < 30; t += 1 / 60) step(s, 1 / 60);
+  check("30s demo run scores", s.score > 0 && s.caught > 0, "score=" + s.score + " caught=" + s.caught);
+
+  lines.unshift("Mochi Drop self-test — " + pass + "/" + total + " PASS");
+  out.textContent = lines.join("\n");
+  document.title = "Mochi Drop test " + pass + "/" + total;
+  console.log(lines.join("\n"));
+  return { pass, total };
+}
+
+/* ---------------- main loop ---------------- */
+let state = makeState(mulberry32((Date.now() % 2147483647) || 1));
+let last = performance.now();
+let pointerX = null;
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (!DEMO && pointerX !== null) state.plateX = pointerX;
+  step(state, dt);
+  if (state.over && DEMO && state.overT > 2) {
+    state = makeState(mulberry32((Date.now() % 2147483647) || 1));
+  }
+  draw(state);
+  requestAnimationFrame(frame);
+}
+
+function bindInput() {
+  function toX(e) {
+    const r = cv.getBoundingClientRect();
+    const cx = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+    return (cx / r.width) * W;
+  }
+  cv.addEventListener("pointerdown", (e) => {
+    if (state.over && !DEMO) { state = makeState(mulberry32((Date.now() % 2147483647) || 1)); return; }
+    pointerX = toX(e);
+  });
+  cv.addEventListener("pointermove", (e) => { if (pointerX !== null) pointerX = toX(e); });
+  cv.addEventListener("pointerup", () => { pointerX = null; });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft") state.plateX -= 34;
+    if (e.key === "ArrowRight") state.plateX += 34;
+    if ((e.key === " " || e.key === "Enter") && state.over && !DEMO) {
+      state = makeState(mulberry32((Date.now() % 2147483647) || 1));
+    }
+  });
+}
+
+if (TEST) {
+  runTests();
+} else {
+  bindInput();
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
